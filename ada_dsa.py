@@ -67,7 +67,11 @@ def fp8_mqa_logits(q_fp8, kv_fp8, weights, cu_seqlen_ks, cu_seqlen_ke, clean_log
 
 
 def get_paged_mqa_logits_metadata(*args, **kwargs):
-    return None  # the Triton path computes its own grid
+    # Return a non-None dummy tensor (not None) so sglang's cuda-graph replay can
+    # `.copy_()` into a pre-existing buffer — a frozen-dataclass field that is None at
+    # capture cannot be reassigned at replay. The Triton paged path ignores this entirely.
+    dev = args[0].device if (args and hasattr(args[0], "device")) else torch.device("cuda")
+    return torch.zeros(1, dtype=torch.int32, device=dev)
 
 
 def _windowed_topk_logical(score, lengths, topk, row_starts=None):
@@ -133,32 +137,32 @@ def fast_topk_transform_ragged_fused(score, lengths, topk_indices_offset, topk, 
 
 def fp8_paged_mqa_logits(q_fp8, kv_cache_fp8, weights, context_lens, block_tables,
                          schedule_metadata=None, max_seq_len=None, clean_logits=False, **kw):
+    # CUDA-graph-safe: fixed shapes, tensor-valued context lengths (no host .item()),
+    # gather clamped in-bounds. The per-batch loop is fine for capture because batch is
+    # fixed per captured graph; only the host sync / dynamic slicing had to go.
     dev = q_fp8.device
     batch = q_fp8.shape[0]
     D = q_fp8.shape[-1]
     block_kv = kv_cache_fp8.shape[1]
-    if max_seq_len is None:
-        max_seq_len = block_tables.shape[1] * block_kv
-    cl = context_lens.reshape(-1).to(torch.int64)
+    max_blocks = block_tables.shape[1]
+    S = max_blocks * block_kv if max_seq_len is None else max_seq_len
     N = kv_cache_fp8.shape[0]
     cu = kv_cache_fp8.reshape(N * block_kv, -1)        # [N*block_kv, D+4 bytes]
     data = cu[:, :D].reshape(N * block_kv, D).view(torch.float8_e4m3fn)
     scale = cu[:, D:].contiguous().view(torch.float32).reshape(-1)
-    logits = torch.full((batch, max_seq_len), float("-inf"), dtype=torch.float32, device=dev)
-    ar = torch.arange(block_kv, device=dev)
-    for b in range(batch):
-        ctx = int(cl[b])
-        if ctx <= 0:
-            continue
-        nblk = (ctx + block_kv - 1) // block_kv
-        blk = block_tables[b, :nblk].to(torch.int64)
-        tok = (blk[:, None] * block_kv + ar[None, :]).reshape(-1)[:ctx]
-        qb = q_fp8[b, 0]                                # [heads, D]
-        wb = weights[b]                                 # [heads]
-        lg = _mqa_logits(qb.unsqueeze(0), data[tok], scale[tok], wb.unsqueeze(0).float(),
-                         torch.zeros(1, dtype=torch.int32, device=dev),
-                         torch.tensor([ctx], dtype=torch.int32, device=dev))
-        logits[b, :ctx] = lg[0]
+    ar = torch.arange(block_kv, device=dev, dtype=torch.int64)
+    ke_all = context_lens.reshape(-1).to(torch.int32)          # [batch] tensor, no .item()
+    ks0 = torch.zeros(1, dtype=torch.int32, device=dev)
+    logits = torch.full((batch, S), float("-inf"), dtype=torch.float32, device=dev)
+    nblk = (S + block_kv - 1) // block_kv                       # fixed python int
+    maxtok = N * block_kv
+    for b in range(batch):                                      # fixed batch -> capturable
+        blk = block_tables[b, :nblk].to(torch.int64)            # fixed shape
+        tok = (blk[:, None] * block_kv + ar[None, :]).reshape(-1)[:S].clamp(0, maxtok - 1)
+        lg = _mqa_logits(q_fp8[b, 0].unsqueeze(0), data[tok], scale[tok],
+                         weights[b].unsqueeze(0).float(), ks0, ke_all[b:b + 1],
+                         clean_logits=True)
+        logits[b] = lg[0]                                       # full-row assign (fixed)
     return logits
 
 

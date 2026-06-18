@@ -51,7 +51,11 @@ Fix: **`--disable-shared-experts-fusion`**. The shared expert then runs as a sep
 - 24× RTX 4090-48GB, 3 nodes × 8, TP=8 × PP=3, over a 10 GbE inter-node link.
 - `--disable-cuda-graph` is required: the stock cuda-graph decode-metadata kernel is SM90+, and the portable paged-logits path runs eager.
 - NCCL transport (`NCCL_P2P_DISABLE` / `NCCL_IB_DISABLE`) should be set to match your interconnect.
-- **Throughput / why eager:** single-stream decode is ~2.5 tok/s here (eager). CUDA-graph capture currently fails: (a) `deep_gemm_wrapper.configure_deep_gemm_num_sms` references an unimportable `deep_gemm` during capture (guard it to no-op when deep_gemm is absent), and (b) the portable paged indexer `fp8_paged_mqa_logits` uses a host-side loop (`int(context_lens[b])`) that invalidates the capture stream. A fully-tensorized paged-indexer kernel (no `.item()` / Python loop) is the path to graph capture and higher throughput.
+- **Throughput / CUDA-graph:** about **10 tok/s single-stream with CUDA-graph**, vs about 2.5 in eager. The decode is launch/CPU-bound (GPUs sit ~20% utilized in eager), so graph capture is a ~4x win. Three things were needed to make capture + replay work on this stack, all included here:
+  1. The portable paged indexer `fp8_paged_mqa_logits` is written capture-safe: fixed shapes, tensor-valued context lengths (no host `.item()`), gather clamped in-bounds. The per-batch loop is fine because batch is fixed per captured graph.
+  2. `get_paged_mqa_logits_metadata` returns a small non-None dummy tensor (sglang's replay does an in-place `.copy_()` into this frozen-dataclass field; a `None` at capture cannot be reassigned at replay).
+  3. One one-line guard in `deep_gemm_wrapper/entrypoint.py`: `configure_deep_gemm_num_sms` references an unimportable `deep_gemm` during capture, so guard it to no-op when deep_gemm is absent (`if num_sms is None or 'deep_gemm' not in globals():`).
+  Further headroom: the decode currently dequantizes the whole KV cache each layer when only the 2048 selected tokens are used; dequant-on-gather would push single-stream higher, and batching pushes aggregate throughput much higher.
 - Validated on GLM-5.2-FP8: 78 layers, MLA head 576 (= 512 nope + 64 rope), `page_size=64`, 256 routed + 1 shared expert.
 
 ## Upstreaming

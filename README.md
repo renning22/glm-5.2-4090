@@ -11,6 +11,7 @@ output:  "Paris. Distance from Paris to Lyon is 391 km, while direct flight time
 
 - **Full 753B model, full FP8** — not a distilled or int4 variant. The complete GLM-5.2-FP8 weights.
 - **24× RTX 4090-48GB** (3 nodes × 8), pipeline + tensor parallel — proven, coherent chat / reasoning / code.
+- **~10 tokens/sec single-stream** (CUDA-graph) — interactive speed for the full 753B on commodity cards.
 - **Every ported kernel validated** against a reference, down to ~1e-6 — including **0.999999** cosine on the live model's real tensors.
 - **Open** — the kernels, the one-call installer, and the verification scripts are all here.
 
@@ -50,13 +51,13 @@ Tested against an sglang build with the `nsa` / tilelang DSA backend, in an envi
      --tp-size 8 --pp-size 3 --nnodes 3 --dist-init-addr <rank0-ip>:30200 \
      --trust-remote-code --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.85 \
      --attention-backend nsa --nsa-decode-backend tilelang --nsa-prefill-backend tilelang \
-     --fp8-gemm-backend triton --disable-cuda-graph \
-     --disable-shared-experts-fusion \      # REQUIRED on Ada — see TECHNICAL.md
+     --fp8-gemm-backend triton \
+     --disable-shared-experts-fusion \      # REQUIRED on Ada (the MoE fix), see TECHNICAL.md
      --tool-call-parser glm47 --reasoning-parser glm45 \
      --node-rank <0|1|2> --host 0.0.0.0 --port 8000
    ```
 
-`--disable-cuda-graph` and `--disable-shared-experts-fusion` are both required on Ada. Configure NCCL transport (`NCCL_P2P_DISABLE` / `NCCL_IB_DISABLE`) to match your fabric.
+`--disable-shared-experts-fusion` is required on Ada. CUDA-graph is on by default here and gives the full speed (about 10 tok/s single-stream vs about 2.5 in eager); it needs one extra one-line guard in `deep_gemm_wrapper/entrypoint.py` (see TECHNICAL.md). If you'd rather not patch that, add `--disable-cuda-graph` and run eager. Configure NCCL transport (`NCCL_P2P_DISABLE` / `NCCL_IB_DISABLE`) to match your fabric.
 
 ## How it works
 
@@ -64,7 +65,7 @@ Tested against an sglang build with the `nsa` / tilelang DSA backend, in an envi
 
 ## Status
 
-This is a **capability** result — GLM-5.2 runs *correctly* on consumer hardware where the stock stack hard-crashes. Single-stream decode is ~2.5 tok/s today (eager mode); cuda-graph capture and throughput tuning are future work. The portable indexer / top-k / page-transform stack is model-agnostic and should apply to other DSA models (e.g. DeepSeek-V3.2-style) with minor adjustment.
+GLM-5.2 runs *correctly* on consumer hardware where the stock stack hard-crashes, at **about 10 tokens/sec single-stream** (CUDA-graph; about 2.5 in eager mode). That's interactive speed for the full 753B model on commodity cards. The portable indexer / top-k / page-transform stack is model-agnostic and should apply to other DSA models (e.g. DeepSeek-V3.2-style) with minor adjustment.
 
 ## License
 
