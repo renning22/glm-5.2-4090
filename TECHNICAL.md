@@ -40,7 +40,7 @@ Every ported kernel is validated against a reference on sm_89 (scripts in [`veri
 
 ## The MoE fix (`--disable-shared-experts-fusion`)
 
-With the DSA stack ported, attention is correct (0.999999 on live tensors) but output was still incoherent. A per-layer residual-norm trace showed a *structurally healthy* forward — finite, smooth growth, normal "massive-activation" spikes, continuous across pipeline boundaries — i.e. a subtle value error, not an explosion or a transfer corruption.
+With the DSA stack ported, attention is correct (0.999999 on live tensors) but output was still incoherent. A per-layer residual-norm trace showed a *structurally healthy* forward — finite, smooth growth, normal "massive-activation" spikes, continuous across pipeline boundaries — i.e. a subtle value error, not an explosion or a cross-node transfer issue.
 
 Root cause: GLM-5.2 has `n_shared_experts=1`, and sglang by default **fuses the shared expert into the routed-expert grouped fp8 MoE GEMM**, whose fused path is wrong on sm_89. (The standalone *dense* block-fp8 GEMM is correct — it's specifically the grouped/fused MoE kernel with the shared expert folded in.)
 
