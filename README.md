@@ -32,13 +32,13 @@ The FP8 weights are ~**753 GB**, so the model has to be split across enough card
 Tested against an sglang build with the `nsa` / tilelang DSA backend, in an environment where `tilelang` is available (we grafted tilelang 0.1.11 + tvm-ffi from [KTransformers](https://github.com/kvcache-ai/ktransformers)).
 
 1. Put `ada_dsa.py` on `PYTHONPATH`.
-2. Append the guard to `sglang/srt/layers/attention/nsa/nsa_indexer.py` (after its `import deep_gemm`):
+2. Apply the two small sglang edits (idempotent, backs up originals):
 
-   ```python
-   import torch
-   if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] < 9:
-       import ada_dsa; ada_dsa.apply_patches()
+   ```bash
+   python apply_sglang_patches.py
    ```
+
+   This (a) calls `ada_dsa.apply_patches()` from `nsa_indexer.py` to swap the SM90+/SM100 DSA kernels, and (b) adds the one-line `deep_gemm` guard needed for CUDA-graph. (Both edits are documented in [TECHNICAL.md](TECHNICAL.md) if you'd rather do them by hand.)
 
 3. Launch (example: 24× RTX 4090-48GB, TP=8 × PP=3):
 
