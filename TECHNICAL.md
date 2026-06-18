@@ -51,6 +51,7 @@ Fix: **`--disable-shared-experts-fusion`**. The shared expert then runs as a sep
 - 24× RTX 4090-48GB, 3 nodes × 8, TP=8 × PP=3, over a 10 GbE inter-node link.
 - `--disable-cuda-graph` is required: the stock cuda-graph decode-metadata kernel is SM90+, and the portable paged-logits path runs eager.
 - NCCL transport (`NCCL_P2P_DISABLE` / `NCCL_IB_DISABLE`) should be set to match your interconnect.
+- **Throughput / why eager:** single-stream decode is ~2.5 tok/s here (eager). CUDA-graph capture currently fails: (a) `deep_gemm_wrapper.configure_deep_gemm_num_sms` references an unimportable `deep_gemm` during capture (guard it to no-op when deep_gemm is absent), and (b) the portable paged indexer `fp8_paged_mqa_logits` uses a host-side loop (`int(context_lens[b])`) that invalidates the capture stream. A fully-tensorized paged-indexer kernel (no `.item()` / Python loop) is the path to graph capture and higher throughput.
 - Validated on GLM-5.2-FP8: 78 layers, MLA head 576 (= 512 nope + 64 rope), `page_size=64`, 256 routed + 1 shared expert.
 
 ## Upstreaming
