@@ -147,9 +147,15 @@ def fp8_paged_mqa_logits(q_fp8, kv_cache_fp8, weights, context_lens, block_table
     max_blocks = block_tables.shape[1]
     S = max_blocks * block_kv if max_seq_len is None else max_seq_len
     N = kv_cache_fp8.shape[0]
-    cu = kv_cache_fp8.reshape(N * block_kv, -1)        # [N*block_kv, D+4 bytes]
-    data = cu[:, :D].reshape(N * block_kv, D).view(torch.float8_e4m3fn)
-    scale = cu[:, D:].contiguous().view(torch.float32).reshape(-1)
+    # The index-K cache is *struct-of-arrays per page*: a page of `block_kv` tokens is
+    # [block_kv*D fp8 keys] followed by [block_kv fp32 scales], NOT interleaved 132-byte
+    # rows. (See sglang's fused store kernel jit_kernel/csrc/nsa/fused_store_index_cache.cuh
+    # and the GetK/GetS accessors.) Parsing it as array-of-structs corrupts every key past
+    # the first plus all scales, which silently breaks top-k selection once the sequence
+    # exceeds index_topk (=2048) — below that, all keys are selected so it's masked.
+    raw = kv_cache_fp8.reshape(N, -1)                  # [N, block_kv*(D+4)] uint8 page
+    data = raw[:, : D * block_kv].reshape(N * block_kv, D).contiguous().view(torch.float8_e4m3fn)
+    scale = raw[:, D * block_kv:].contiguous().view(torch.float32).reshape(-1)
     ar = torch.arange(block_kv, device=dev, dtype=torch.int64)
     ke_all = context_lens.reshape(-1).to(torch.int32)          # [batch] tensor, no .item()
     ks0 = torch.zeros(1, dtype=torch.int32, device=dev)

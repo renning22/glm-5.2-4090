@@ -46,6 +46,16 @@ Root cause: GLM-5.2 has `n_shared_experts=1`, and sglang by default **fuses the 
 
 Fix: **`--disable-shared-experts-fusion`**. The shared expert then runs as a separate (verified-correct) dense GEMM → fully coherent output. The routed experts go through the grouped GEMM and are correct too, so the bug was specifically the *fusion*.
 
+## The long-context fix (index-K cache layout)
+
+Short prompts were perfect but anything past **2048 tokens** (`index_topk`) degraded into garbage. The tell: the failure scaled with how far context exceeded 2048, and it was invisible below it.
+
+Root cause: the **indexer K-cache is laid out struct-of-arrays *per page*** — a 64-token page is `[64 × 128 fp8 keys]` followed by `[64 × fp32 scales]`, not interleaved 132-byte rows. (See sglang's fused store kernel `jit_kernel/csrc/nsa/fused_store_index_cache.cuh` and the `GetK`/`GetS` accessors; the layout is also documented on the buffer in `memory_pool.py`.) The portable paged-indexer shim originally parsed it as array-of-structs (`cu[:, :128]=key`, `cu[:, 128:132]=scale` per row), which reads every key past the first — and every scale — from the wrong bytes.
+
+Why it only shows above 2048: those corrupted scores only decide *which* `index_topk=2048` keys survive. At or below 2048 **every** key is selected regardless of score, so the corruption is fully masked; above it, the wrong keys get attended and quality collapses as more keys must be dropped.
+
+Fix: parse the page as `[D*block_kv fp8 keys][block_kv fp32 scales]` (one line in `fp8_paged_mqa_logits`). Against the real layout this moves top-2048 agreement from **0.68 → 1.0**, and long-context selection becomes correct (sane scores, diverse early/mid/recent positions). Verified against the write kernel, the accessor reader, and live needle-in-context retrieval.
+
 ## Notes on the test deployment
 
 - 24× RTX 4090-48GB, 3 nodes × 8, TP=8 × PP=3, over a 10 GbE inter-node link.
