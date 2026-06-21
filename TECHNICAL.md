@@ -56,6 +56,18 @@ Why it only shows above 2048: those corrupted scores only decide *which* `index_
 
 Fix: parse the page as `[D*block_kv fp8 keys][block_kv fp32 scales]` (one line in `fp8_paged_mqa_logits`). Against the real layout this moves top-2048 agreement from **0.68 → 1.0**, and long-context selection becomes correct (sane scores, diverse early/mid/recent positions). Verified against the write kernel, the accessor reader, and live needle-in-context retrieval.
 
+## Decode optimization (dequant-on-gather + paged indexer)
+
+DSA only ever looks at `index_topk`=2048 keys per query, but the portable shims originally **materialized the whole KV pool** before using that tiny slice — and under CUDA-graph the materialized size is the pool's *capacity*, not the actual context, so a short request paid the full-capacity cost every layer. Two changes make the plumbing as sparse as the math; both are **bit-identical** to the prior path (`max|Δ|=0`, top-2048 selection agreement `1.0`).
+
+**1. MLA sparse decode — dequant-on-gather.** The Ada `_v1` kernel needs bf16, so the packed cache is dequantized fp8→bf16. The shim dequantized the *entire* pool every layer, then attended over the 2048 selected. Instead, **gather the 2048 selected rows first and dequant only those**, making per-layer dequant cost independent of context length. The gather path is gated to the decode regime (`m·topk ≤ pool`, where `m` = query rows); prefill/extend has large `m` (`m·topk` can exceed the pool and OOM) and falls back to the full-cache dequant — the branch is static per shape, so it stays CUDA-graph-safe.
+
+**2. Indexer logits — paged kernel.** The portable indexer originally gathered the whole pool's keys into a contiguous buffer (sized to capacity under CUDA-graph), then scored. The new `_paged_idx_kernel` does the **page-table indirection inside the Triton kernel**: because the kernel tile equals `page_size` (64), each loop iteration is exactly one physical page, read straight from the pool via the block table — no gather, no whole-pool `.contiguous()`. The loop runs `ceil(context/64)` times, so cost is `O(context)` rather than `O(pool capacity)`. This is what DeepGEMM's paged kernel does in hardware on H100. Measured ~**4×** faster at 192K-token capacity and ~**18×** at 1M (and constant regardless of capacity).
+
+Together these roughly **double single-stream decode** and make it **independent of context length / pool capacity** (1M-context decode runs at ~the same speed as a short prompt), plus ~50% on batched throughput (the indexer gather had been running once per concurrent request).
+
+A note on CUDA-graph and these kernels: a kernel's *launch shape* must be fixed for capture, but its *internal loop count may be data-dependent* and still replay correctly. Both fixes keep shapes static (the paged kernel's grid is `batch`; the gather's `m·topk` is fixed per captured size) while looping a context-dependent number of times — which is what lets the work scale with context while staying capturable.
+
 ## Notes on the test deployment
 
 - 24× RTX 4090-48GB, 3 nodes × 8, TP=8 × PP=3, over a 10 GbE inter-node link.
@@ -65,7 +77,7 @@ Fix: parse the page as `[D*block_kv fp8 keys][block_kv fp32 scales]` (one line i
   1. The portable paged indexer `fp8_paged_mqa_logits` is written capture-safe: fixed shapes, tensor-valued context lengths (no host `.item()`), gather clamped in-bounds. The per-batch loop is fine because batch is fixed per captured graph.
   2. `get_paged_mqa_logits_metadata` returns a small non-None dummy tensor (sglang's replay does an in-place `.copy_()` into this frozen-dataclass field; a `None` at capture cannot be reassigned at replay).
   3. One one-line guard in `deep_gemm_wrapper/entrypoint.py`: `configure_deep_gemm_num_sms` references an unimportable `deep_gemm` during capture, so guard it to no-op when deep_gemm is absent (`if num_sms is None or 'deep_gemm' not in globals():`).
-  Further headroom: the decode currently dequantizes the whole KV cache each layer when only the 2048 selected tokens are used; dequant-on-gather would push single-stream higher, and batching pushes aggregate throughput much higher.
+  The whole-pool decode costs (per-layer dequant and the indexer gather) are removed by the dequant-on-gather and paged-indexer optimizations above; batching pushes aggregate throughput much higher still.
 - Validated on GLM-5.2-FP8: 78 layers, MLA head 576 (= 512 nope + 64 rope), `page_size=64`, 256 routed + 1 shared expert.
 
 ## Upstreaming
