@@ -80,6 +80,16 @@ A note on CUDA-graph and these kernels: a kernel's *launch shape* must be fixed 
   The whole-pool decode costs (per-layer dequant and the indexer gather) are removed by the dequant-on-gather and paged-indexer optimizations above; batching pushes aggregate throughput much higher still.
 - Validated on GLM-5.2-FP8: 78 layers, MLA head 576 (= 512 nope + 64 rope), `page_size=64`, 256 routed + 1 shared expert.
 
+## Tuned block-FP8 GEMM configs (sm_89) — [`gemm_configs/`](gemm_configs/)
+
+The DSA port above makes GLM-5.2 *run* on Ada; tuned GEMM configs make it *fast*. sglang's W8A8 block-FP8 triton kernel reads a per-`(N, K, device, block_shape)` tuned config and ships them for H100/H200/B200/A100 — but not the 4090, so on Ada it falls back to a generic default (`Using default W8A8 Block FP8 kernel config. Performance might be sub-optimal!`). On the 4090 that default is genuinely bad.
+
+[`gemm_configs/`](gemm_configs/) has tuned configs for the 9 dense GEMM shapes GLM-5.2 hits per layer (MLA q/kv projections, fused QKV `N=2624,K=6144`, dense-MLP gate/up/down, output proj, lightning indexer `N=128/512`). Drop them into `<sglang>/srt/layers/quantization/configs/` and sglang auto-loads them. **Measured: ~+17% decode aggregate throughput, ~+90% at 16K context.** Lossless — pure kernel scheduling. Generated with sglang's `tuning_block_wise_kernel.py`; pruning its grid to the decode-M regime cuts tuning ~9× (see the `gemm_configs/` README).
+
+### The ceiling is *latency*, not bandwidth or compute
+
+With the DSA port + tuned configs + CUDA-graph, batched decode on a multi-node 4090 setup is **latency-bound**: at high batch the SMs sit at ~100% issue utilization while retiring only **~0.3% of peak FP8 FLOPs** and moving **~10–20% of HBM bandwidth**. The cycles go to memory-access *latency* in the tiny-M decode GEMMs, the per-token TP all-reduce / PP collectives, and the serial layer chain — not to throughput limits. So kernel tuning helps (it trims the small-kernel stalls), but the remaining order-of-magnitude levers are structural: **speculative decoding** (PP-incompatible in sglang today) and a **faster interconnect / NVLink** (datacenter-only). On consumer multi-GPU the practical aggregate ceiling is a latency ceiling — worth knowing before chasing it with more batch or bandwidth.
+
 ## Upstreaming
 
-Two clean contributions: (1) the portable DSA kernel stack here — closes sglang #23657 / ktransformers #1885 for sub-Hopper NVIDIA (and applies to `sm_120` consumer Blackwell, which the stock `sm_90`/`sm_100` kernels also miss); (2) a `sm < 90` guard that auto-disables shared-expert fusion, or a fix for the fused grouped-GEMM on Ada.
+Three clean contributions: (1) the portable DSA kernel stack here — closes sglang #23657 / ktransformers #1885 for sub-Hopper NVIDIA (and applies to `sm_120` consumer Blackwell, which the stock `sm_90`/`sm_100` kernels also miss); (2) a `sm < 90` guard that auto-disables shared-expert fusion, or a fix for the fused grouped-GEMM on Ada; (3) the tuned `sm_89` block-FP8 GEMM configs in [`gemm_configs/`](gemm_configs/) — upstreamable straight into sglang's `quantization/configs/`.
