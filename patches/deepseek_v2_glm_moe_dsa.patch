@@ -1,0 +1,80 @@
+--- a/srt/models/deepseek_v2.py
++++ b/srt/models/deepseek_v2.py
+@@ -1492,7 +1492,23 @@
+                 prefix=add_prefix("kv_a_proj_with_mqa", prefix),
+             )
+ 
+-        if self.use_nsa:
++        # GLM-MoE-DSA: only "full" layers carry indexer weights; "shared" layers
++        # reuse the most recent full layer's top-k. Derive per-layer mode from the
++        # config (indexer_types preferred, else index_topk_freq/index_skip_topk_offset).
++        # Default to full (compute own) when unknown, which matches plain DeepSeek-V3.2.
++        self.nsa_indexer_is_full = True
++        if self.use_nsa and layer_id is not None:
++            _itypes = getattr(config, "indexer_types", None)
++            if _itypes is not None and 0 <= layer_id < len(_itypes):
++                self.nsa_indexer_is_full = (_itypes[layer_id] == "full")
++            else:
++                _freq = getattr(config, "index_topk_freq", None)
++                if _freq is not None:
++                    _freq = max(int(_freq), 1)
++                    _off = int(getattr(config, "index_skip_topk_offset", 2) or 2)
++                    self.nsa_indexer_is_full = (max(layer_id - _off + 1, 0) % _freq) == 0
++
++        if self.use_nsa and self.nsa_indexer_is_full:
+             is_neox_style = not getattr(config, "indexer_rope_interleave", False)
+             self.indexer = Indexer(
+                 hidden_size=hidden_size,
+@@ -1860,6 +1876,23 @@
+         k_pe = latent_cache_output[..., self.kv_lora_rank :].unsqueeze(1)
+         return k_nope, k_pe
+ 
++    def _nsa_topk_indices(self, hidden_states, q_lora, positions, forward_batch):
++        # GLM-MoE-DSA index-sharing: "full" layers compute their own top-k and
++        # stash it on forward_batch; "shared" layers (no indexer weights) reuse the
++        # most recent full layer's top-k. Plain DeepSeek-V3.2 has all-full layers,
++        # so this is a no-op there (every layer computes + stashes its own).
++        if self.nsa_indexer_is_full:
++            topk_indices = self.indexer(
++                x=hidden_states,
++                q_lora=q_lora,
++                positions=positions,
++                forward_batch=forward_batch,
++                layer_id=self.layer_id,
++            )
++            forward_batch.nsa_shared_topk_indices = topk_indices
++            return topk_indices
++        return getattr(forward_batch, "nsa_shared_topk_indices", None)
++
+     def forward_absorb_prepare(
+         self,
+         positions: torch.Tensor,
+@@ -1956,24 +1989,16 @@
+                     q = self.q_b_proj(q)[0].view(
+                         -1, self.num_local_heads, self.qk_head_dim
+                     )
+-                topk_indices = self.indexer(
+-                    x=hidden_states,
+-                    q_lora=q_lora,
+-                    positions=positions,
+-                    forward_batch=forward_batch,
+-                    layer_id=self.layer_id,
++                topk_indices = self._nsa_topk_indices(
++                    hidden_states, q_lora, positions, forward_batch
+                 )
+                 current_stream.wait_stream(self.alt_stream)
+             else:
+                 k_nope = k_nope.unsqueeze(1)
+                 q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+                 if q_lora is not None:
+-                    topk_indices = self.indexer(
+-                        x=hidden_states,
+-                        q_lora=q_lora,
+-                        positions=positions,
+-                        forward_batch=forward_batch,
+-                        layer_id=self.layer_id,
++                    topk_indices = self._nsa_topk_indices(
++                        hidden_states, q_lora, positions, forward_batch
+                     )
+         else:
+             q = self.q_proj(hidden_states)[0].view(

@@ -68,12 +68,21 @@ Together these roughly **double single-stream decode** and make it **independent
 
 A note on CUDA-graph and these kernels: a kernel's *launch shape* must be fixed for capture, but its *internal loop count may be data-dependent* and still replay correctly. Both fixes keep shapes static (the paged kernel's grid is `batch`; the gather's `m·topk` is fixed per captured size) while looping a context-dependent number of times — which is what lets the work scale with context while staying capturable.
 
+## GLM-MoE-DSA index-sharing (shared-layer top-k reuse)
+
+GLM-5.2 does **not** run the DSA indexer on every layer. Its config tags each layer's indexer as **"full"** or **"shared"**: full layers carry indexer weights and compute their own top-k; shared layers carry none and **reuse the most recent full layer's** selected keys. Stock sglang's `deepseek_v2.py` is written for all-full DSA (DeepSeek-V3.2) — it builds an `Indexer` on every NSA layer and calls it every layer, which on GLM-5.2 both wastes the indexer GEMM + top-k on shared layers and expects indexer weights the checkpoint doesn't ship for them.
+
+The patch ([`patches/deepseek_v2_glm_moe_dsa.patch`](patches/deepseek_v2_glm_moe_dsa.patch), applied by `apply_sglang_patches.py`):
+
+- Derives a per-layer `nsa_indexer_is_full` from the config — `indexer_types` if present, else `index_topk_freq` / `index_skip_topk_offset` — and only constructs the `Indexer` on full layers.
+- Routes both attention call-sites through a small `_nsa_topk_indices()`: a full layer computes the top-k and stashes it on `forward_batch.nsa_shared_topk_indices`; a shared layer reads it back.
+- Is a **no-op on all-full DSA models** (DeepSeek-V3.2): every layer is full, so each computes + stashes its own and nothing is shared — bit-identical to stock.
+
 ## Notes on the test deployment
 
-- 24× RTX 4090-48GB, 3 nodes × 8, TP=8 × PP=3, over a 10 GbE inter-node link.
-- `--disable-cuda-graph` is required: the stock cuda-graph decode-metadata kernel is SM90+, and the portable paged-logits path runs eager.
+- 32× RTX 4090-48GB, 4 nodes × 8, TP=8 × PP=4 (layer split `18,20,20,20`), over a 10 GbE inter-node link.
 - NCCL transport (`NCCL_P2P_DISABLE` / `NCCL_IB_DISABLE`) should be set to match your interconnect.
-- **Throughput / CUDA-graph:** about **10 tok/s single-stream with CUDA-graph**, vs about 2.5 in eager. The decode is launch/CPU-bound (GPUs sit ~20% utilized in eager), so graph capture is a ~4x win. Three things were needed to make capture + replay work on this stack, all included here:
+- **Throughput / CUDA-graph:** about **24 tok/s single-stream with CUDA-graph** (vs ~2.5 in eager). The decode is launch/CPU-bound (GPUs sit ~20% utilized in eager), so graph capture is the dominant single-stream win. Three things were needed to make capture + replay work on this stack, all included here:
   1. The portable paged indexer `fp8_paged_mqa_logits` is written capture-safe: fixed shapes, tensor-valued context lengths (no host `.item()`), gather clamped in-bounds. The per-batch loop is fine because batch is fixed per captured graph.
   2. `get_paged_mqa_logits_metadata` returns a small non-None dummy tensor (sglang's replay does an in-place `.copy_()` into this frozen-dataclass field; a `None` at capture cannot be reassigned at replay).
   3. One one-line guard in `deep_gemm_wrapper/entrypoint.py`: `configure_deep_gemm_num_sms` references an unimportable `deep_gemm` during capture, so guard it to no-op when deep_gemm is absent (`if num_sms is None or 'deep_gemm' not in globals():`).

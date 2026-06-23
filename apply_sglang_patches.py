@@ -5,6 +5,9 @@
      GPUs (swaps the SM90+/SM100 DSA kernels for the portable ones in ada_dsa.py).
   2. Guard `configure_deep_gemm_num_sms` so CUDA-graph capture doesn't touch an
      unimportable `deep_gemm` (needed only for the ~4x CUDA-graph speedup).
+  3. Apply the GLM-MoE-DSA index-sharing edit to `models/deepseek_v2.py` (full
+     layers compute the DSA top-k and stash it; shared layers reuse it) — a no-op
+     on all-full DSA models like DeepSeek-V3.2. See `patches/` + TECHNICAL.md.
 
 Idempotent. Run once after installing sglang, with `ada_dsa.py` on PYTHONPATH:
 
@@ -15,6 +18,7 @@ Originals are backed up with a `.orig` suffix on first run.
 import importlib.util
 import os
 import shutil
+import subprocess
 import sys
 
 
@@ -67,9 +71,39 @@ def patch_deep_gemm_wrapper(root):
     print("[ok]   patched deep_gemm_wrapper/entrypoint.py (CUDA-graph deep_gemm guard)")
 
 
+def patch_deepseek_v2(root):
+    f = os.path.join(root, "srt/models/deepseek_v2.py")
+    if not os.path.exists(f):
+        print("[skip] models/deepseek_v2.py not present (older sglang)")
+        return
+    if "nsa_shared_topk_indices" in open(f).read():
+        print("[skip] deepseek_v2.py already has GLM-MoE-DSA index-sharing")
+        return
+    patch_file = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "patches", "deepseek_v2_glm_moe_dsa.patch"
+    )
+    if not os.path.exists(patch_file):
+        print("[warn] patches/deepseek_v2_glm_moe_dsa.patch missing; apply the index-sharing edit by hand, see TECHNICAL.md")
+        return
+    _backup(f)
+    try:
+        subprocess.run(
+            ["patch", "-p1", "-d", root, "-i", patch_file],
+            check=True, capture_output=True, text=True,
+        )
+        print("[ok]   patched models/deepseek_v2.py (GLM-MoE-DSA index-sharing)")
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        if os.path.exists(f + ".orig"):
+            shutil.copy2(f + ".orig", f)  # restore — leave the tree clean
+        detail = (getattr(e, "stderr", "") or str(e)).strip()
+        print("[warn] could not apply deepseek_v2 patch (sglang drift or no `patch` tool); "
+              "apply patches/deepseek_v2_glm_moe_dsa.patch by hand, see TECHNICAL.md\n       " + detail)
+
+
 if __name__ == "__main__":
     root = _sglang_root()
     print("sglang:", root)
     patch_nsa_indexer(root)
     patch_deep_gemm_wrapper(root)
+    patch_deepseek_v2(root)
     print("done. Make sure ada_dsa.py is importable (on PYTHONPATH).")

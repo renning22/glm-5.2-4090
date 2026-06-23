@@ -10,8 +10,8 @@ output:  "Paris. Distance from Paris to Lyon is 391 km, while direct flight time
 ## Highlights
 
 - **Full 753B model, full FP8** — not a distilled or int4 variant. The complete GLM-5.2-FP8 weights.
-- **24× RTX 4090-48GB** (3 nodes × 8), pipeline + tensor parallel — proven, coherent chat / reasoning / code.
-- **~10 tokens/sec single-stream** (CUDA-graph) — interactive speed for the full 753B on commodity cards.
+- **32× RTX 4090-48GB** (4 nodes × 8), pipeline + tensor parallel — proven, coherent chat / reasoning / code.
+- **~24 tokens/sec single-stream** (CUDA-graph) — interactive speed for the full 753B on commodity cards.
 - **Every ported kernel validated** against a reference, down to ~1e-6 — including **0.999999** cosine on the live model's real tensors.
 - **Open** — the kernels, the one-call installer, and the verification scripts are all here.
 
@@ -21,7 +21,7 @@ The FP8 weights are ~**753 GB**, so the model has to be split across enough card
 
 | GPU | VRAM/card | GPUs needed | Layout | Status |
 |---|---|---|---|---|
-| RTX 4090 | 48 GB | **24** | TP=8 × PP=3 (3 nodes) | ✅ proven (this repo) |
+| RTX 4090 | 48 GB | **32** | TP=8 × PP=4 (4 nodes) | ✅ proven (this repo) |
 | RTX 4090 | 24 GB | ~40–48 | TP=8 × PP=5–6 (5–6 nodes) | sizing estimate |
 | RTX 5090 | 32 GB | ~32 | TP=8 × PP=4 (4 nodes) | sizing estimate¹ |
 
@@ -32,40 +32,41 @@ The FP8 weights are ~**753 GB**, so the model has to be split across enough card
 Tested against an sglang build with the `nsa` / tilelang DSA backend, in an environment where `tilelang` is available (we grafted tilelang 0.1.11 + tvm-ffi from [KTransformers](https://github.com/kvcache-ai/ktransformers)).
 
 1. Put `ada_dsa.py` on `PYTHONPATH`.
-2. Apply the two small sglang edits (idempotent, backs up originals):
+2. Apply the sglang edits (idempotent, backs up originals):
 
    ```bash
    python apply_sglang_patches.py
    ```
 
-   This (a) calls `ada_dsa.apply_patches()` from `nsa_indexer.py` to swap the SM90+/SM100 DSA kernels, and (b) adds the one-line `deep_gemm` guard needed for CUDA-graph. (Both edits are documented in [TECHNICAL.md](TECHNICAL.md) if you'd rather do them by hand.)
+   This (a) calls `ada_dsa.apply_patches()` from `nsa_indexer.py` to swap the SM90+/SM100 DSA kernels, (b) adds the one-line `deep_gemm` guard needed for CUDA-graph, and (c) applies the GLM-MoE-DSA index-sharing edit to `models/deepseek_v2.py`. (All three are documented in [TECHNICAL.md](TECHNICAL.md) if you'd rather do them by hand.)
 
-3. Launch (example: 24× RTX 4090-48GB, TP=8 × PP=3):
+3. Launch (example: 32× RTX 4090-48GB, TP=8 × PP=4):
 
    ```bash
    export SGLANG_NSA_FUSE_TOPK=1            # use the ported fused page-mapping transforms
    export SGLANG_ENABLE_JIT_DEEPGEMM=0
+   export SGLANG_PP_LAYER_PARTITION=18,20,20,20   # 78 layers across 4 pipeline stages
 
    python -m sglang.launch_server \
      --model-path zai-org/GLM-5.2-FP8 \
-     --tp-size 8 --pp-size 3 --nnodes 3 --dist-init-addr <rank0-ip>:30200 \
-     --trust-remote-code --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.85 \
+     --tp-size 8 --pp-size 4 --nnodes 4 --dist-init-addr <rank0-ip>:30200 \
+     --trust-remote-code --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.90 \
      --attention-backend nsa --nsa-decode-backend tilelang --nsa-prefill-backend tilelang \
      --fp8-gemm-backend triton \
      --disable-shared-experts-fusion \      # REQUIRED on Ada (the MoE fix), see TECHNICAL.md
      --tool-call-parser glm47 --reasoning-parser glm45 \
-     --node-rank <0|1|2> --host 0.0.0.0 --port 8000
+     --node-rank <0|1|2|3> --host 0.0.0.0 --port 8000
    ```
 
-`--disable-shared-experts-fusion` is required on Ada. CUDA-graph is on by default here and gives the full speed (about 10 tok/s single-stream vs about 2.5 in eager); it needs one extra one-line guard in `deep_gemm_wrapper/entrypoint.py` (see TECHNICAL.md). If you'd rather not patch that, add `--disable-cuda-graph` and run eager. Configure NCCL transport (`NCCL_P2P_DISABLE` / `NCCL_IB_DISABLE`) to match your fabric.
+`--disable-shared-experts-fusion` is required on Ada. CUDA-graph is on by default here and gives the full speed (about 24 tok/s single-stream vs about 2.5 in eager); it needs one extra one-line guard in `deep_gemm_wrapper/entrypoint.py` (see TECHNICAL.md). If you'd rather not patch that, add `--disable-cuda-graph` and run eager. Configure NCCL transport (`NCCL_P2P_DISABLE` / `NCCL_IB_DISABLE`) to match your fabric.
 
 ## How it works
 
-`ada_dsa.py` monkeypatches GLM-5.2's SM90+/SM100-only DSA kernels — the lightning-indexer GEMM, the top-k + page-mapping, and the MLA sparse decode — with portable Triton + a non-WGMMA tilelang path, only on sub-Hopper GPUs. Plus one config fix for the MoE. **Full write-up, kernel-by-kernel walkthrough, and the verification table: [TECHNICAL.md](TECHNICAL.md).**
+`ada_dsa.py` monkeypatches GLM-5.2's SM90+/SM100-only DSA kernels — the lightning-indexer GEMM, the top-k + page-mapping, and the MLA sparse decode — with portable Triton + a non-WGMMA tilelang path, only on sub-Hopper GPUs. Plus one config fix for the MoE, and a small model-level patch so GLM's *shared* DSA layers reuse the previous *full* layer's top-k instead of recomputing it. **Full write-up, kernel-by-kernel walkthrough, and the verification table: [TECHNICAL.md](TECHNICAL.md).**
 
 ## Status
 
-GLM-5.2 runs *correctly* on consumer hardware where the stock stack hard-crashes, at **about 10 tokens/sec single-stream** (CUDA-graph; about 2.5 in eager mode). That's interactive speed for the full 753B model on commodity cards. The portable indexer / top-k / page-transform stack is model-agnostic and should apply to other DSA models (e.g. DeepSeek-V3.2-style) with minor adjustment.
+GLM-5.2 runs *correctly* on consumer hardware where the stock stack hard-crashes, at **about 24 tokens/sec single-stream** (CUDA-graph; about 2.5 in eager mode). That's interactive speed for the full 753B model on commodity cards. The portable indexer / top-k / page-transform stack is model-agnostic and should apply to other DSA models (e.g. DeepSeek-V3.2-style) with minor adjustment.
 
 ## License
 
