@@ -11,7 +11,7 @@ output:  "Paris. Distance from Paris to Lyon is 391 km, while direct flight time
 
 - **Full 753B model, full FP8** — not a distilled or int4 variant. The complete GLM-5.2-FP8 weights.
 - **32× RTX 4090-48GB** (4 nodes × 8), pipeline + tensor parallel — proven, coherent chat / reasoning / code.
-- **~24 tokens/sec single-stream** (CUDA-graph) — interactive speed for the full 753B on commodity cards.
+- **~24 tok/s single-stream, ~650 tok/s aggregate** (64 concurrent streams, CUDA-graph) — interactive single-user speed *and* real serving throughput for the full 753B on commodity cards.
 - **Every ported kernel validated** against a reference, down to ~1e-6 — including **0.999999** cosine on the live model's real tensors.
 - **Open** — the kernels, the one-call installer, and the verification scripts are all here.
 
@@ -66,7 +66,7 @@ Tested against an sglang build with the `nsa` / tilelang DSA backend, in an envi
 
 ## Status
 
-GLM-5.2 runs *correctly* on consumer hardware where the stock stack hard-crashes, at **about 24 tokens/sec single-stream** (CUDA-graph; about 2.5 in eager mode). That's interactive speed for the full 753B model on commodity cards. The portable indexer / top-k / page-transform stack is model-agnostic and should apply to other DSA models (e.g. DeepSeek-V3.2-style) with minor adjustment.
+GLM-5.2 runs *correctly* on consumer hardware where the stock stack hard-crashes, at **about 24 tokens/sec single-stream** (CUDA-graph; about 2.5 in eager mode), and **~650 tok/s aggregate across 64 concurrent streams**. That's interactive speed for the full 753B model on commodity cards, and real serving throughput at batch. The portable indexer / top-k / page-transform stack is model-agnostic and should apply to other DSA models (e.g. DeepSeek-V3.2-style) with minor adjustment.
 
 ## License
 

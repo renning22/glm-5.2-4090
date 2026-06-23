@@ -86,7 +86,7 @@ The patch ([`patches/deepseek_v2_glm_moe_dsa.patch`](patches/deepseek_v2_glm_moe
   1. The portable paged indexer `fp8_paged_mqa_logits` is written capture-safe: fixed shapes, tensor-valued context lengths (no host `.item()`), gather clamped in-bounds. The per-batch loop is fine because batch is fixed per captured graph.
   2. `get_paged_mqa_logits_metadata` returns a small non-None dummy tensor (sglang's replay does an in-place `.copy_()` into this frozen-dataclass field; a `None` at capture cannot be reassigned at replay).
   3. One one-line guard in `deep_gemm_wrapper/entrypoint.py`: `configure_deep_gemm_num_sms` references an unimportable `deep_gemm` during capture, so guard it to no-op when deep_gemm is absent (`if num_sms is None or 'deep_gemm' not in globals():`).
-  The whole-pool decode costs (per-layer dequant and the indexer gather) are removed by the dequant-on-gather and paged-indexer optimizations above; batching pushes aggregate throughput much higher still.
+  The whole-pool decode costs (per-layer dequant and the indexer gather) are removed by the dequant-on-gather and paged-indexer optimizations above; batching pushes aggregate throughput much higher — measured ~**140 tok/s** at 8 concurrent streams, ~**280** at 24, ~**420** at 40, and ~**650** at 64 (sublinear because decode is latency-bound, see below).
 - Validated on GLM-5.2-FP8: 78 layers, MLA head 576 (= 512 nope + 64 rope), `page_size=64`, 256 routed + 1 shared expert.
 
 ## Tuned block-FP8 GEMM configs (sm_89) — [`gemm_configs/`](gemm_configs/)
