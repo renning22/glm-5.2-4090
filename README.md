@@ -12,6 +12,7 @@ output:  "Paris. Distance from Paris to Lyon is 391 km, while direct flight time
 - **Full 753B model, full FP8** — not a distilled or int4 variant. The complete GLM-5.2-FP8 weights.
 - **32× RTX 4090-48GB** (4 nodes × 8), pipeline + tensor parallel — proven, coherent chat / reasoning / code.
 - **~24 tok/s single-stream, ~725 tok/s aggregate** (peak, ~128 concurrent streams, CUDA-graph) — interactive single-user speed *and* real serving throughput for the full 753B on commodity cards.
+- **Drives real coding agents** — verified end-to-end as the model behind a live **Claude Code** session (tool calls, multi-turn loops, streaming), served via an OpenAI/Anthropic-compatible gateway.
 - **Every ported kernel validated** against a reference, down to ~1e-6 — including **0.999999** cosine on the live model's real tensors.
 - **Open** — the kernels, the one-call installer, and the verification scripts are all here.
 
